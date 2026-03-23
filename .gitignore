@@ -11,3 +11,11 @@ wheels/
 
 # Environment variables — never commit secrets
 .env
+
+# Trained model binaries — regenerate via train_weather_model.ipynb
+models/*.json
+models/*.ubj
+
+# Notebook outputs and artefacts
+*.png
+.ipynb_checkpoints/

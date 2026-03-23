@@ -9,10 +9,11 @@ Tools exposed:
   - get_forecast(days)          → 5-day forecast with rain probability
   - get_weather_analytics()     → stats + trends from ChromaDB history
   - search_weather_history(q)   → semantic vector search over past records
-  - get_weather_prediction()    → linear trend + pattern prediction from history
+  - get_weather_prediction()    → XGBoost ML prediction (fallback: linear trend)
 """
 
 import os
+import pathlib
 from datetime import datetime, timezone
 from statistics import mean, stdev
 from typing import Any
@@ -43,6 +44,35 @@ OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 OWM_BASE = "https://api.openweathermap.org/data/2.5"
 
 mcp = FastMCP("weather")
+
+# ── XGBoost models (optional — trained via train_weather_model.ipynb) ─────────
+# Feature order MUST match FEATURE_NAMES in the training notebook:
+#   hour, month, day_of_year, temp_lag1, temp_lag2, temp_lag3,
+#   humidity, wind_speed, pressure, rain_lag1
+_MODEL_DIR  = pathlib.Path(__file__).parent / "models"
+_xgb_temp: Any = None   # XGBRegressor  — predicts next temperature
+_xgb_rain: Any = None   # XGBClassifier — predicts rain probability
+
+try:
+    import numpy as _np          # noqa: E402  (numpy is a transitive dep of chromadb)
+    import xgboost as _xgb_lib   # noqa: E402
+
+    _tp = _MODEL_DIR / "weather_xgb_temp.json"
+    _rp = _MODEL_DIR / "weather_xgb_rain.json"
+    if _tp.exists() and _rp.exists():
+        _xgb_temp = _xgb_lib.XGBRegressor()
+        _xgb_temp.load_model(str(_tp))
+        _xgb_rain = _xgb_lib.XGBClassifier()
+        _xgb_rain.load_model(str(_rp))
+        print(f"[weather-mcp] XGBoost models loaded from {_MODEL_DIR}", flush=True)
+    else:
+        print(
+            "[weather-mcp] XGBoost model files not found — using linear fallback. "
+            "Run train_weather_model.ipynb to train them.",
+            flush=True,
+        )
+except ImportError:
+    _np = None  # type: ignore[assignment]
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -91,6 +121,7 @@ def _store_record(
     description: str,
     wind_speed: float,
     rain_1h: float = 0.0,
+    pressure: float = 1013.0,
 ) -> str:
     """
     Persist one weather snapshot to ChromaDB.
@@ -120,6 +151,7 @@ def _store_record(
         "description": description,      # e.g. "light rain", "clear sky"
         "wind_speed": wind_speed,
         "rain_1h": rain_1h,
+        "pressure": pressure,
         "timestamp": ts,
         "date": ts[:10],
         "hour": int(ts[11:13]),
@@ -167,6 +199,7 @@ async def get_current_weather() -> str:
         description=w["description"],
         wind_speed=wind["speed"],
         rain_1h=rain,
+        pressure=float(main.get("pressure", 1013.0)),
     )
 
     vis_str = f"{vis} m" if vis is not None else "N/A"
@@ -344,19 +377,41 @@ async def search_weather_history(query: str, top_k: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _xgb_feature_vector(ordered: list[dict]) -> "list[float] | None":
+    """
+    Build the 10-element feature vector expected by the XGBoost models.
+    Feature order: hour, month, day_of_year, temp_lag1, temp_lag2, temp_lag3,
+                   humidity, wind_speed, pressure, rain_lag1
+    Returns None when there are fewer than 3 records available.
+    """
+    if len(ordered) < 3:
+        return None
+    now    = datetime.now(timezone.utc)
+    latest = ordered[-1]
+    return [
+        float(now.hour),
+        float(now.month),
+        float(now.timetuple().tm_yday),
+        ordered[-1]["temp"],           # temp_lag1
+        ordered[-2]["temp"],           # temp_lag2
+        ordered[-3]["temp"],           # temp_lag3
+        float(latest["humidity"]),
+        float(latest["wind_speed"]),
+        float(latest.get("pressure", 1013.0)),
+        float(latest["rain_1h"]),      # rain_lag1
+    ]
+
+
 @mcp.tool()
 async def get_weather_prediction() -> str:
     """
-    Predict upcoming weather based on patterns in ChromaDB history.
+    Predict upcoming weather from ChromaDB history.
 
-    Method:
-      - Temperature: ordinary least-squares linear trend extrapolated one step
-      - Rain: frequency in the most recent 10 records
-      - Conditions: mode of recent conditions
-      - Humidity: average of last 5 records
+    Uses a trained XGBoost model when available (train via train_weather_model.ipynb),
+    otherwise falls back to ordinary least-squares linear regression.
 
-    More history = better predictions.  Combine with get_forecast for
-    a fuller picture.
+    XGBoost features: hour, month, day_of_year, last 3 temperatures,
+                      humidity, wind_speed, pressure, rain_lag1
     """
     result = _col.get(include=["metadatas"])
     metas  = result["metadatas"]
@@ -369,12 +424,10 @@ async def get_weather_prediction() -> str:
 
     # Sort chronologically
     ordered = sorted(metas, key=lambda m: m["timestamp"])
+    temps   = [m["temp"] for m in ordered]
+    n       = len(temps)
 
-    temps  = [m["temp"]    for m in ordered]
-    n      = len(temps)
-
-    # ── Linear regression slope on temperature ───────────────────────────────
-    # slope = Σ (i - ī)(t - t̄) / Σ (i - ī)²
+    # ── Linear regression slope (always computed for trend direction) ─────────
     x_mean = (n - 1) / 2.0
     y_mean = mean(temps)
     denom  = sum((i - x_mean) ** 2 for i in range(n))
@@ -382,33 +435,45 @@ async def get_weather_prediction() -> str:
         sum((i - x_mean) * (temps[i] - y_mean) for i in range(n)) / denom
         if denom > 0 else 0.0
     )
-    predicted_next = temps[-1] + slope
 
-    # ── Rain probability from recent 10 records ──────────────────────────────
-    recent       = ordered[-min(10, n):]
-    rain_hits    = sum(1 for m in recent if m["rain_1h"] > 0)
-    rain_pct     = rain_hits / len(recent) * 100
+    # ── XGBoost prediction ────────────────────────────────────────────────────
+    xgb_used       = False
+    predicted_next = temps[-1] + slope   # linear fallback
+    rain_pct: float
 
-    # ── Likely condition ─────────────────────────────────────────────────────
+    if _xgb_temp is not None and _xgb_rain is not None and _np is not None:
+        feats = _xgb_feature_vector(ordered)
+        if feats is not None:
+            X              = _np.array([feats])
+            predicted_next = float(_xgb_temp.predict(X)[0])
+            rain_pct       = float(_xgb_rain.predict_proba(X)[0][1]) * 100
+            xgb_used       = True
+
+    # ── Rain probability fallback (last 10 records frequency) ────────────────
+    recent    = ordered[-min(10, n):]
+    rain_hits = sum(1 for m in recent if m["rain_1h"] > 0)
+    if not xgb_used:
+        rain_pct = rain_hits / len(recent) * 100
+
+    # ── Likely condition & humidity ───────────────────────────────────────────
     recent_conds = [m["conditions"] for m in recent]
     likely_cond  = max(set(recent_conds), key=recent_conds.count)
-
-    # ── Humidity (last 5) ────────────────────────────────────────────────────
     avg_humidity = mean(m["humidity"] for m in ordered[-5:])
 
-    direction = "warming" if slope > 0.2 else "cooling" if slope < -0.2 else "stable"
-    rain_icon = "⛈  Yes" if rain_pct > 40 else "🌦  Possible" if rain_pct > 20 else "☀  Unlikely"
+    direction  = "warming" if slope > 0.2 else "cooling" if slope < -0.2 else "stable"
+    rain_icon  = "Yes" if rain_pct > 40 else "Possible" if rain_pct > 20 else "Unlikely"
+    method_str = "XGBoost ML model" if xgb_used else "linear regression (train model for ML predictions)"
 
     return (
         f"Weather Prediction  (from {n} historical records)\n"
         f"{'━'*50}\n"
-        f"Temperature\n"
+        f"Method            : {method_str}\n"
+        f"\nTemperature\n"
         f"  Last recorded   : {temps[-1]:.1f}°C\n"
         f"  Predicted next  : {predicted_next:.1f}°C\n"
         f"  Trend           : {direction}  (slope {slope:+.3f}°C / interval)\n"
         f"\nRain\n"
-        f"  Recent frequency: {rain_hits}/{len(recent)} checks  ({rain_pct:.0f}%)\n"
-        f"  Rain likely?    : {rain_icon}\n"
+        f"  Rain likely?    : {rain_icon}  ({rain_pct:.0f}%)\n"
         f"\nConditions        : {likely_cond}\n"
         f"Avg Humidity      : {avg_humidity:.0f}%\n"
         f"\nTip: call get_forecast for a data-backed 5-day outlook too."
